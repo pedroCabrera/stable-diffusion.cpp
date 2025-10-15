@@ -1463,6 +1463,79 @@ static void sample_k_diffusion(sample_method_t method,
             }
         } break;
 
+        case UNIPC: {  // Unified Predictor-Corrector sampler
+            struct ggml_tensor* noise = ggml_dup_tensor(work_ctx, x);
+            struct ggml_tensor* d1    = ggml_dup_tensor(work_ctx, x);
+            struct ggml_tensor* d2    = ggml_dup_tensor(work_ctx, x);
+
+            for (int i = 0; i < steps; i++) {
+                float sigma = sigmas[i];
+                float sigma_next = sigmas[i + 1];
+
+                // denoise
+                ggml_tensor* denoised = model(x, sigma, i + 1);
+
+                // d1 = (x - denoised) / sigma
+                {
+                    float* vec_d1        = (float*)d1->data;
+                    float* vec_x         = (float*)x->data;
+                    float* vec_denoised  = (float*)denoised->data;
+
+                    for (int j = 0; j < ggml_nelements(d1); j++) {
+                        vec_d1[j] = (vec_x[j] - vec_denoised[j]) / sigma;
+                    }
+                }
+
+                if (i < steps - 1) {
+                    // Second order correction step
+                    ggml_tensor* denoised2 = model(x, sigma, i + 1);
+
+                    // d2 = (x - denoised2) / sigma
+                    {
+                        float* vec_d2        = (float*)d2->data;
+                        float* vec_x         = (float*)x->data;
+                        float* vec_denoised2 = (float*)denoised2->data;
+
+                        for (int j = 0; j < ggml_nelements(d2); j++) {
+                            vec_d2[j] = (vec_x[j] - vec_denoised2[j]) / sigma;
+                        }
+                    }
+
+                    // Combine predictions: d = (3*d1 - d2) / 2
+                    {
+                        float* vec_d1 = (float*)d1->data;
+                        float* vec_d2 = (float*)d2->data;
+
+                        for (int j = 0; j < ggml_nelements(d1); j++) {
+                            vec_d1[j] = (3.0f * vec_d1[j] - vec_d2[j]) / 2.0f;
+                        }
+                    }
+                }
+
+                // x = x + d1 * (sigma_next - sigma)
+                {
+                    float* vec_x  = (float*)x->data;
+                    float* vec_d1 = (float*)d1->data;
+
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_x[j] = vec_x[j] + vec_d1[j] * (sigma_next - sigma);
+                    }
+                }
+
+                // Add noise if not last step
+                if (sigma_next > 0 && i < steps - 1) {
+                    ggml_tensor_set_f32_randn(noise, rng);
+
+                    float* vec_x     = (float*)x->data;
+                    float* vec_noise = (float*)noise->data;
+
+                    for (int j = 0; j < ggml_nelements(x); j++) {
+                        vec_x[j] = vec_x[j] + vec_noise[j] * sigma_next * eta;
+                    }
+                }
+            }
+        } break;
+
         default:
             LOG_ERROR("Attempting to sample with nonexisting sample method %i", method);
             abort();

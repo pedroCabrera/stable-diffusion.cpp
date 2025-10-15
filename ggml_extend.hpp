@@ -1902,6 +1902,10 @@ public:
         }
     }
 
+    virtual void map_by_name(std::map<std::string, struct ggml_tensor*>& tensors, const std::string prefix) {
+        get_param_tensors(tensors, prefix);
+    }
+
     virtual std::string get_desc() {
         return "GGMLBlock";
     }

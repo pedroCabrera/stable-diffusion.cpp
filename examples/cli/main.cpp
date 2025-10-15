@@ -76,6 +76,7 @@ struct SDParams {
     std::string control_image_path;
     std::vector<std::string> ref_image_paths;
     std::string control_video_path;
+    std::string control_masks_path;
     bool increase_ref_index = false;
 
     std::string prompt;
@@ -500,6 +501,7 @@ void parse_args(int argc, const char** argv, SDParams& params) {
         {"", "--mask", "", &params.mask_image_path},
         {"", "--control-image", "", &params.control_image_path},
         {"", "--control-video", "", &params.control_video_path},
+        {"", "--control-masks", "", &params.control_masks_path},
         {"-o", "--output", "", &params.output_path},
         {"-p", "--prompt", "", &params.prompt},
         {"-n", "--negative-prompt", "", &params.negative_prompt},
@@ -1177,6 +1179,7 @@ int main(int argc, const char* argv[]) {
     std::vector<sd_image_t> ref_images;
     std::vector<sd_image_t> pmid_images;
     std::vector<sd_image_t> control_frames;
+    std::vector<sd_image_t> control_masks;
 
     auto release_all_resources = [&]() {
         free(init_image.data);
@@ -1198,6 +1201,11 @@ int main(int argc, const char* argv[]) {
             image.data = NULL;
         }
         control_frames.clear();
+        for (auto image : control_masks) {
+            free(image.data);
+            image.data = NULL;
+        }
+        control_masks.clear();
     };
 
     if (params.init_image_path.size() > 0) {
@@ -1286,6 +1294,18 @@ int main(int argc, const char* argv[]) {
     if (!params.control_video_path.empty()) {
         if (!load_images_from_dir(params.control_video_path,
                                   control_frames,
+                                  params.width,
+                                  params.height,
+                                  params.video_frames,
+                                  params.verbose)) {
+            release_all_resources();
+            return 1;
+        }
+    }
+
+    if (!params.control_masks_path.empty()) {
+        if (!load_images_from_dir(params.control_masks_path,
+                                  control_masks,
                                   params.width,
                                   params.height,
                                   params.video_frames,
@@ -1387,6 +1407,8 @@ int main(int argc, const char* argv[]) {
         results     = generate_image(sd_ctx, &img_gen_params);
         num_results = params.batch_count;
     } else if (params.mode == VID_GEN) {
+        printf("CLI: Mode is VID_GEN, calling generate_video\n");
+        fflush(stdout);
         sd_vid_gen_params_t vid_gen_params = {
             params.prompt.c_str(),
             params.negative_prompt.c_str(),
@@ -1395,6 +1417,8 @@ int main(int argc, const char* argv[]) {
             end_image,
             control_frames.data(),
             (int)control_frames.size(),
+            control_masks.data(),
+            (int)control_masks.size(),
             params.width,
             params.height,
             params.sample_params,

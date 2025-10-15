@@ -12,6 +12,7 @@
 #include "diffusion_model.hpp"
 #include "esrgan.hpp"
 #include "lora.hpp"
+#include "mini_max_remover.hpp"
 #include "pmid.hpp"
 #include "tae.hpp"
 #include "vae.hpp"
@@ -40,6 +41,7 @@ const char* model_version_to_str[] = {
     "Wan 2.x",
     "Wan 2.2 I2V",
     "Wan 2.2 TI2V",
+    "MiniMax-Remover",
 };
 
 const char* sampling_methods_str[] = {
@@ -56,6 +58,7 @@ const char* sampling_methods_str[] = {
     "DDIM \"trailing\"",
     "TCD",
     "Euler A",
+    "UniPC",
 };
 
 /*================================================== Helper Functions ================================================*/
@@ -251,6 +254,18 @@ public:
             }
         }
 
+        // Pre-detect MiniMax-Remover
+        bool is_minimax = false;
+        if (strlen(SAFE_STR(sd_ctx_params->model_path)) > 0 &&
+            (strstr(SAFE_STR(sd_ctx_params->model_path), "minimax") ||
+             strstr(SAFE_STR(sd_ctx_params->model_path), "MiniMax")) ||
+            strlen(SAFE_STR(sd_ctx_params->diffusion_model_path)) > 0 &&
+            (strstr(SAFE_STR(sd_ctx_params->diffusion_model_path), "minimax") ||
+             strstr(SAFE_STR(sd_ctx_params->diffusion_model_path), "MiniMax"))) {
+            is_minimax = true;
+            LOG_INFO("MiniMax-Remover detected");
+        }
+
         if (strlen(SAFE_STR(sd_ctx_params->vae_path)) > 0) {
             LOG_INFO("loading vae from '%s'", sd_ctx_params->vae_path);
             if (!model_loader.init_from_file(sd_ctx_params->vae_path, "vae.")) {
@@ -260,8 +275,13 @@ public:
 
         version = model_loader.get_sd_version();
         if (version == VERSION_COUNT) {
-            LOG_ERROR("get sd version from file failed: '%s'", SAFE_STR(sd_ctx_params->model_path));
-            return false;
+            // Check if this is MiniMax-Remover
+            if (is_minimax) {
+                version = VERSION_MINIMAX_REMOVER;
+            } else {
+                LOG_ERROR("get sd version from file failed: '%s'", SAFE_STR(sd_ctx_params->model_path));
+                return false;
+            }
         }
 
         LOG_INFO("Version: %s ", model_version_to_str[version]);
@@ -383,6 +403,13 @@ public:
                                                               version,
                                                               sd_ctx_params->diffusion_flash_attn,
                                                               sd_ctx_params->chroma_use_dit_mask);
+            } else if (version == VERSION_MINIMAX_REMOVER) {
+                diffusion_model  = std::make_shared<MinimaxRemoverModel>(backend,
+                                                                        offload_params_to_cpu,
+                                                                        model_loader.tensor_storages_types,
+                                                                        "",
+                                                                        version,
+                                                                        sd_ctx_params->diffusion_flash_attn);
             } else if (sd_version_is_wan(version)) {
                 cond_stage_model = std::make_shared<T5CLIPEmbedder>(clip_backend,
                                                                     offload_params_to_cpu,
@@ -437,12 +464,14 @@ public:
                 }
             }
 
-            cond_stage_model->alloc_params_buffer();
-            cond_stage_model->get_param_tensors(tensors);
-
+            if (cond_stage_model) {
+                cond_stage_model->alloc_params_buffer();
+                cond_stage_model->get_param_tensors(tensors);
+            }
+            printf("Allocating Buffer for diffusion_model\n");
             diffusion_model->alloc_params_buffer();
             diffusion_model->get_param_tensors(tensors);
-
+            printf("Buffer allocated for diffusion_model\n");
             if (sd_version_is_unet_edit(version)) {
                 vae_decode_only = false;
             }
@@ -466,6 +495,15 @@ public:
                                                                         "first_stage_model",
                                                                         vae_decode_only,
                                                                         version);
+                first_stage_model->alloc_params_buffer();
+                first_stage_model->get_param_tensors(tensors, "first_stage_model");
+            } 
+            else if (version == VERSION_MINIMAX_REMOVER) {
+                first_stage_model = std::make_shared<MINIMAX::MinimaxVAERunner>(vae_backend,
+                                                                        offload_params_to_cpu,
+                                                                        model_loader.tensor_storages_types,
+                                                                        "first_stage_model",
+                                                                        vae_decode_only);
                 first_stage_model->alloc_params_buffer();
                 first_stage_model->get_param_tensors(tensors, "first_stage_model");
             } else if (!use_tiny_autoencoder) {
@@ -590,7 +628,10 @@ public:
         // LOG_DEBUG("model size = %.2fMB", total_size / 1024.0 / 1024.0);
 
         {
-            size_t clip_params_mem_size = cond_stage_model->get_params_buffer_size();
+            size_t clip_params_mem_size = 0;
+            if (cond_stage_model) {
+                clip_params_mem_size = cond_stage_model->get_params_buffer_size();
+            }
             size_t unet_params_mem_size = diffusion_model->get_params_buffer_size();
             if (high_noise_diffusion_model) {
                 unet_params_mem_size += high_noise_diffusion_model->get_params_buffer_size();
@@ -1606,6 +1647,7 @@ const char* sample_method_to_str[] = {
     "ddim_trailing",
     "tcd",
     "euler_a",
+    "unipc",
 };
 
 const char* sd_sample_method_name(enum sample_method_t sample_method) {
@@ -2021,37 +2063,41 @@ sd_image_t* generate_image_internal(sd_ctx_t* sd_ctx,
 
     // Get learned condition
     t0               = ggml_time_ms();
-    SDCondition cond = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
-                                                                           sd_ctx->sd->n_threads,
-                                                                           prompt,
-                                                                           clip_skip,
-                                                                           width,
-                                                                           height,
-                                                                           sd_ctx->sd->diffusion_model->get_adm_in_channels());
-
+    SDCondition cond;
     SDCondition uncond;
-    if (guidance.txt_cfg != 1.0 ||
-        (sd_version_is_inpaint_or_unet_edit(sd_ctx->sd->version) && guidance.txt_cfg != guidance.img_cfg)) {
-        bool zero_out_masked = false;
-        if (sd_version_is_sdxl(sd_ctx->sd->version) && negative_prompt.size() == 0 && !sd_ctx->sd->is_using_edm_v_parameterization) {
-            zero_out_masked = true;
+    int64_t t1 = 0;
+    if (sd_ctx->sd->cond_stage_model) {
+        cond = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
+                                                                        sd_ctx->sd->n_threads,
+                                                                        prompt,
+                                                                        clip_skip,
+                                                                        width,
+                                                                        height,
+                                                                        sd_ctx->sd->diffusion_model->get_adm_in_channels());
+
+        
+        if (guidance.txt_cfg != 1.0 ||
+            (sd_version_is_inpaint_or_unet_edit(sd_ctx->sd->version) && guidance.txt_cfg != guidance.img_cfg)) {
+            bool zero_out_masked = false;
+            if (sd_version_is_sdxl(sd_ctx->sd->version) && negative_prompt.size() == 0 && !sd_ctx->sd->is_using_edm_v_parameterization) {
+                zero_out_masked = true;
+            }
+            uncond = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
+                                                                        sd_ctx->sd->n_threads,
+                                                                        negative_prompt,
+                                                                        clip_skip,
+                                                                        width,
+                                                                        height,
+                                                                        sd_ctx->sd->diffusion_model->get_adm_in_channels(),
+                                                                        zero_out_masked);
         }
-        uncond = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
-                                                                     sd_ctx->sd->n_threads,
-                                                                     negative_prompt,
-                                                                     clip_skip,
-                                                                     width,
-                                                                     height,
-                                                                     sd_ctx->sd->diffusion_model->get_adm_in_channels(),
-                                                                     zero_out_masked);
-    }
-    int64_t t1 = ggml_time_ms();
-    LOG_INFO("get_learned_condition completed, taking %" PRId64 " ms", t1 - t0);
+        t1 = ggml_time_ms();
+        LOG_INFO("get_learned_condition completed, taking %" PRId64 " ms", t1 - t0);
 
-    if (sd_ctx->sd->free_params_immediately) {
-        sd_ctx->sd->cond_stage_model->free_params_buffer();
+        if (sd_ctx->sd->free_params_immediately) {
+            sd_ctx->sd->cond_stage_model->free_params_buffer();
+        }
     }
-
     // Control net hint
     struct ggml_tensor* image_hint = NULL;
     if (control_image.data != NULL) {
@@ -2479,8 +2525,11 @@ sd_image_t* generate_image(sd_ctx_t* sd_ctx, const sd_img_gen_params_t* sd_img_g
 
 SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* sd_vid_gen_params, int* num_frames_out) {
     if (sd_ctx == NULL || sd_vid_gen_params == NULL) {
+        LOG_ERROR("generate_video: NULL parameters");
         return NULL;
     }
+
+    LOG_INFO("generate_video called with %d control frames, %d control masks", sd_vid_gen_params->control_frames_size, sd_vid_gen_params->control_masks_size);
 
     std::string prompt          = SAFE_STR(sd_vid_gen_params->prompt);
     std::string negative_prompt = SAFE_STR(sd_vid_gen_params->negative_prompt);
@@ -2523,7 +2572,7 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
     params.mem_size   = static_cast<size_t>(1024 * 1024) * 1024;  // 1G
     params.mem_buffer = NULL;
     params.no_alloc   = false;
-    // LOG_DEBUG("mem_size %u ", params.mem_size);
+    LOG_DEBUG("mem_size %u ", params.mem_size);
 
     struct ggml_context* work_ctx = ggml_init(params);
     if (!work_ctx) {
@@ -2730,18 +2779,22 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
     // Get learned condition
     bool zero_out_masked = true;
     int64_t t1           = ggml_time_ms();
-    SDCondition cond     = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
-                                                                               sd_ctx->sd->n_threads,
-                                                                               prompt,
-                                                                               sd_vid_gen_params->clip_skip,
-                                                                               width,
-                                                                               height,
-                                                                               sd_ctx->sd->diffusion_model->get_adm_in_channels(),
-                                                                               zero_out_masked);
-    cond.c_concat        = concat_latent;
-    cond.c_vector        = clip_vision_output;
+    SDCondition cond;
+    if (sd_ctx->sd->cond_stage_model) {
+        cond = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
+                                                                   sd_ctx->sd->n_threads,
+                                                                   prompt,
+                                                                   sd_vid_gen_params->clip_skip,
+                                                                   width,
+                                                                   height,
+                                                                   sd_ctx->sd->diffusion_model->get_adm_in_channels(),
+                                                                   zero_out_masked);
+        cond.c_concat = concat_latent;
+        cond.c_vector = clip_vision_output;
+    }
+    
     SDCondition uncond;
-    if (sd_vid_gen_params->sample_params.guidance.txt_cfg != 1.0 || sd_vid_gen_params->high_noise_sample_params.guidance.txt_cfg != 1.0) {
+    if (sd_ctx->sd->cond_stage_model && (sd_vid_gen_params->sample_params.guidance.txt_cfg != 1.0 || sd_vid_gen_params->high_noise_sample_params.guidance.txt_cfg != 1.0)) {
         uncond          = sd_ctx->sd->cond_stage_model->get_learned_condition(work_ctx,
                                                                               sd_ctx->sd->n_threads,
                                                                               negative_prompt,
@@ -2757,7 +2810,9 @@ SD_API sd_image_t* generate_video(sd_ctx_t* sd_ctx, const sd_vid_gen_params_t* s
     LOG_INFO("get_learned_condition completed, taking %" PRId64 " ms", t2 - t1);
 
     if (sd_ctx->sd->free_params_immediately) {
-        sd_ctx->sd->cond_stage_model->free_params_buffer();
+        if (sd_ctx->sd->cond_stage_model) {
+            sd_ctx->sd->cond_stage_model->free_params_buffer();
+        }
     }
 
     int W = width / 8;

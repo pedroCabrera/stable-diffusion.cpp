@@ -48,6 +48,7 @@ enum sample_method_t {
     DDIM_TRAILING,
     TCD,
     EULER_A,
+    UNIPC,
     SAMPLE_METHOD_COUNT
 };
 
@@ -224,6 +225,8 @@ typedef struct {
     sd_image_t end_image;
     sd_image_t* control_frames;
     int control_frames_size;
+    sd_image_t* control_masks;
+    int control_masks_size;
     int width;
     int height;
     sd_sample_params_t sample_params;

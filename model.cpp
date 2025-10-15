@@ -15,6 +15,7 @@
 #include "gguf_reader.hpp"
 #include "model.h"
 #include "stable-diffusion.h"
+#include "mini_max_remover.hpp"
 #include "util.h"
 #include "vocab.hpp"
 #include "vocab_umt5.hpp"
@@ -1718,10 +1719,12 @@ SDVersion ModelLoader::get_sd_version() {
     bool is_xl                       = false;
     bool is_flux                     = false;
     bool is_wan                      = false;
+    bool is_minimax_remover          = false;
     int64_t patch_embedding_channels = 0;
     bool has_img_emb                 = false;
 
     for (auto& tensor_storage : tensor_storages) {
+        //printf("Tensor: %s\n", tensor_storage.name.c_str());
         if (!(is_xl || is_flux)) {
             if (tensor_storage.name.find("model.diffusion_model.double_blocks.") != std::string::npos) {
                 is_flux = true;
@@ -2049,7 +2052,9 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                 file_tensors.push_back(&ts);
             }
         }
+        LOG_DEBUG("Found %zu tensors for file_index %zu", file_tensors.size(), file_index);
         if (file_tensors.empty()) {
+            LOG_DEBUG("No tensors for this file, skipping");
             continue;
         }
 
@@ -2061,15 +2066,21 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
             }
         }
 
+        LOG_DEBUG("is_zip = %s, preparing to load %zu tensors", is_zip ? "true" : "false", file_tensors.size());
+
         int n_threads = is_zip ? 1 : std::min(num_threads_to_use, (int)file_tensors.size());
         if (n_threads < 1) {
             n_threads = 1;
         }
         last_n_threads = n_threads;
 
+        LOG_DEBUG("Starting tensor loading with %d threads", n_threads);
+
         std::atomic<size_t> tensor_idx(0);
         std::atomic<bool> failed(false);
         std::vector<std::thread> workers;
+
+        LOG_DEBUG("Creating %d worker threads", n_threads);
 
         for (int i = 0; i < n_threads; ++i) {
             workers.emplace_back([&, file_path, is_zip]() {
@@ -2113,6 +2124,7 @@ bool ModelLoader::load_tensors(on_new_tensor_cb_t on_new_tensor_cb, int n_thread
                     }
 
                     if (dst_tensor == NULL) {
+                        LOG_DEBUG("Tensor '%s' skipped (dst_tensor is NULL)", tensor_storage.name.c_str());
                         t1 = ggml_time_ms();
                         read_time_ms.fetch_add(t1 - t0);
                         continue;

@@ -5,6 +5,8 @@
 #include "mmdit.hpp"
 #include "unet.hpp"
 #include "wan.hpp"
+#include "mini_max_remover.hpp"
+
 
 struct DiffusionParams {
     struct ggml_tensor* x                     = NULL;
@@ -250,6 +252,63 @@ struct WanModel : public DiffusionModel {
                  struct ggml_tensor** output     = NULL,
                  struct ggml_context* output_ctx = NULL) {
         return wan.compute(n_threads,
+                           diffusion_params.x,
+                           diffusion_params.timesteps,
+                           diffusion_params.context,
+                           diffusion_params.y,
+                           diffusion_params.c_concat,
+                           NULL,
+                           diffusion_params.vace_context,
+                           diffusion_params.vace_strength,
+                           output,
+                           output_ctx);
+    }
+};
+
+struct MinimaxRemoverModel : public DiffusionModel {
+    MINIMAX::MinimaxRunner minimax;
+
+    MinimaxRemoverModel(ggml_backend_t backend,
+                        bool offload_params_to_cpu,
+                        const String2GGMLType& tensor_types = {},
+                        const std::string prefix            = "",
+                        SDVersion version                   = VERSION_MINIMAX_REMOVER,
+                        bool flash_attn                     = false)
+        : minimax(backend, offload_params_to_cpu, tensor_types, prefix, version, flash_attn) {}
+
+    std::string get_desc() {
+        return minimax.get_desc();
+    }
+
+    void alloc_params_buffer() {
+        minimax.alloc_params_buffer();
+    }
+
+    void free_params_buffer() {
+        minimax.free_params_buffer();
+    }
+
+    void free_compute_buffer() {
+        minimax.free_compute_buffer();
+    }
+
+    void get_param_tensors(std::map<std::string, struct ggml_tensor*>& tensors) {
+        minimax.get_param_tensors(tensors);
+    }
+
+    size_t get_params_buffer_size() {
+        return minimax.get_params_buffer_size();
+    }
+
+    int64_t get_adm_in_channels() {
+        return minimax.get_adm_in_channels();
+    }
+
+    void compute(int n_threads,
+                 DiffusionParams diffusion_params,
+                 struct ggml_tensor** output     = NULL,
+                 struct ggml_context* output_ctx = NULL) {
+        return minimax.compute(n_threads,
                            diffusion_params.x,
                            diffusion_params.timesteps,
                            diffusion_params.context,
