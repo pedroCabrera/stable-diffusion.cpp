@@ -130,6 +130,7 @@ struct SDParams {
     bool canny_preprocess       = false;
     bool color                  = false;
     int upscale_repeats         = 1;
+    int upscale_tile_size      = 128;
 
     // Photo Maker
     std::string photo_maker_path;
@@ -227,6 +228,7 @@ void print_params(SDParams params) {
     printf("    vae_tiling:                        %s\n", params.vae_tiling_params.enabled ? "true" : "false");
     printf("    force_sdxl_vae_conv_scale:         %s\n", params.force_sdxl_vae_conv_scale ? "true" : "false");
     printf("    upscale_repeats:                   %d\n", params.upscale_repeats);
+    printf("    upscale_tile_size:                 %d\n", params.upscale_tile_size);
     printf("    chroma_use_dit_mask:               %s\n", params.chroma_use_dit_mask ? "true" : "false");
     printf("    chroma_use_t5_mask:                %s\n", params.chroma_use_t5_mask ? "true" : "false");
     printf("    chroma_t5_mask_pad:                %d\n", params.chroma_t5_mask_pad);
@@ -647,6 +649,10 @@ void parse_args(int argc, const char** argv, SDParams& params) {
          "--upscale-repeats",
          "Run the ESRGAN upscaler this many times (default: 1)",
          &params.upscale_repeats},
+        {"",
+         "--upscale-tile-size",
+         "tile size for ESRGAN upscaling (default: 128)",
+         &params.upscale_tile_size},
         {"-H",
          "--height",
          "image height, in pixel space (default: 512)",
@@ -1371,6 +1377,11 @@ void parse_args(int argc, const char** argv, SDParams& params) {
         exit(1);
     }
 
+    if (params.upscale_tile_size < 1) {
+        fprintf(stderr, "error: upscale tile size must be at least 1\n");
+        exit(1);
+    }
+
     if (params.mode == UPSCALE) {
         if (params.esrgan_path.length() == 0) {
             fprintf(stderr, "error: upscale mode needs an upscaler model (--upscale-model)\n");
@@ -1995,7 +2006,8 @@ int main(int argc, const char* argv[]) {
         upscaler_ctx_t* upscaler_ctx = new_upscaler_ctx(params.esrgan_path.c_str(),
                                                         params.offload_params_to_cpu,
                                                         params.diffusion_conv_direct,
-                                                        params.n_threads);
+                                                        params.n_threads,
+                                                        params.upscale_tile_size);
 
         if (upscaler_ctx == nullptr) {
             printf("new_upscaler_ctx failed\n");
